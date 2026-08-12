@@ -48,34 +48,10 @@ Tumors appear hyper-intense on T1-contrast and FLAIR sequences. The prompt engin
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    A["MRI Input"] --> B["CLAHE Contrast Enhancement"]
-    B --> C["Top Intensity Percentile Thresholding"]
-    C --> D["Morphological Noise Removal"]
-    D --> E["Skull and Border Artifact Stripping"]
-    E --> F["Bounding Box and Center Point Extraction"]
-    F --> G["SAM 2 Large<br/>224M parameters"]
-    G --> H["Multi-Mask Candidate Generation"]
-    H --> I["Highest IoU Mask Selection"]
-    I --> J["Segmentation Overlay and Region Report"]
+<img width="1560" height="1880" alt="image" src="https://github.com/user-attachments/assets/0fae41fc-6dd4-476c-937e-16c60b4d87c8" />
 
-    subgraph Prompt["Automatic Prompt Engine"]
-        B
-        C
-        D
-        E
-        F
-    end
 
-    subgraph Inference["SAM 2 Inference"]
-        G
-        H
-        I
-    end
-```
-
-The prompt engine (left of the pipeline) is the only custom component — it exists purely to replace the manual click a standard SAM 2 workflow would require. Everything downstream of the bounding box and point extraction step is stock SAM 2 Large, unmodified and unfine-tuned.
+The prompt engine (top block) is the only custom component — it exists purely to replace the manual click a standard SAM 2 workflow would require. Everything downstream of the bounding box and point extraction step is stock SAM 2 Large, unmodified and unfine-tuned.
 
 ## Model
 
