@@ -50,17 +50,17 @@ Tumors appear hyper-intense on T1-contrast and FLAIR sequences. The prompt engin
 
 ```mermaid
 flowchart TD
-    A[MRI Input] --> B[CLAHE Contrast Enhancement]
-    B --> C[Top Intensity Percentile Thresholding]
-    C --> D[Morphological Noise Removal]
-    D --> E[Skull and Border Artifact Stripping]
-    E --> F[Bounding Box + Center Point Extraction]
-    F --> G[SAM 2 Large - 224M parameters]
-    G --> H[Multi-Mask Candidate Generation]
-    H --> I[Highest IoU Mask Selection]
-    I --> J[Segmentation Overlay + Region Report]
+    A["MRI Input"] --> B["CLAHE Contrast Enhancement"]
+    B --> C["Top Intensity Percentile Thresholding"]
+    C --> D["Morphological Noise Removal"]
+    D --> E["Skull and Border Artifact Stripping"]
+    E --> F["Bounding Box and Center Point Extraction"]
+    F --> G["SAM 2 Large<br/>224M parameters"]
+    G --> H["Multi-Mask Candidate Generation"]
+    H --> I["Highest IoU Mask Selection"]
+    I --> J["Segmentation Overlay and Region Report"]
 
-    subgraph "Automatic Prompt Engine"
+    subgraph Prompt["Automatic Prompt Engine"]
         B
         C
         D
@@ -68,7 +68,7 @@ flowchart TD
         F
     end
 
-    subgraph "SAM 2 Inference"
+    subgraph Inference["SAM 2 Inference"]
         G
         H
         I
