@@ -1,6 +1,6 @@
 # SAM2-Zero-Shot-Tumor-Segmentation
 
-Zero-shot brain tumor segmentation in MRI scans using Meta's SAM 2 with an automatic prompt generation engine.
+Zero-shot brain and breast tumor segmentation in MRI scans using Meta's SAM 2, driven by an automatic prompt generation engine — no fine-tuning, no labeled data, no manual clicks.
 
 ## Overview
 
@@ -12,47 +12,70 @@ This is a research and educational project. All outputs require radiologist revi
 
 ## Demo
 
-### Brain Tumor Segmentation
+### Brain tumor segmentation
 
-| Input MRI | Segmentation Overlay |
-|-----------|----------------------|
-| <img width="245" height="270" alt="Brain MRI Input" src="https://github.com/user-attachments/assets/a3b8a551-3fed-430e-9f2f-2594564d06d5" /> | <img width="277" height="286" alt="Brain Segmentation Output" src="https://github.com/user-attachments/assets/2a402eb2-82da-413f-81f6-554b33805738" /> |
+<table>
+<tr>
+<td align="center"><b>Input MRI</b></td>
+<td align="center"><b>Segmentation Overlay</b></td>
+</tr>
+<tr>
+<td><img width="320" alt="Brain MRI Input" src="https://github.com/user-attachments/assets/a3b8a551-3fed-430e-9f2f-2594564d06d5" /></td>
+<td><img width="320" alt="Brain Segmentation Output" src="https://github.com/user-attachments/assets/2a402eb2-82da-413f-81f6-554b33805738" /></td>
+</tr>
+</table>
 
-### Breast Tumor Segmentation
+### Breast tumor segmentation
 
-| Input MRI | Segmentation Overlay |
-|-----------|----------------------|
-| <img width="363" height="276" alt="Breast MRI Input" src="https://github.com/user-attachments/assets/696454c5-602b-40ff-b771-634459740d9b" /> | <img width="415" height="313" alt="Breast Segmentation Output" src="https://github.com/user-attachments/assets/4c70f30d-8035-4abf-adb1-5a0b05432881" /> |
+<table>
+<tr>
+<td align="center"><b>Input MRI</b></td>
+<td align="center"><b>Segmentation Overlay</b></td>
+</tr>
+<tr>
+<td><img width="320" alt="Breast MRI Input" src="https://github.com/user-attachments/assets/696454c5-602b-40ff-b771-634459740d9b" /></td>
+<td><img width="320" alt="Breast Segmentation Output" src="https://github.com/user-attachments/assets/4c70f30d-8035-4abf-adb1-5a0b05432881" /></td>
+</tr>
+</table>
+
+Both examples show the same pipeline running unmodified — no per-scan tuning, no manual prompts, no anatomy-specific configuration.
 
 ## How It Works
 
 Standard SAM 2 deployments require a human to click on the object of interest to generate prompts. This system replaces that manual step with an automated pipeline built around MRI signal physics.
 
-Tumors appear hyper-intense on T1-contrast and FLAIR sequences. The prompt engine exploits this property by processing the raw image through a series of steps to identify and localize those regions automatically, then feeding the resulting coordinates to SAM 2 as native bounding box and point prompts.
+Tumors appear hyper-intense on T1-contrast and FLAIR sequences. The prompt engine exploits this property, processing the raw image through a series of steps to identify and localize those regions automatically, then feeding the resulting coordinates to SAM 2 as native bounding box and point prompts.
 
-## Pipeline
+## Architecture
 
+```mermaid
+flowchart TD
+    A[MRI Input] --> B[CLAHE Contrast Enhancement]
+    B --> C[Top Intensity Percentile Thresholding]
+    C --> D[Morphological Noise Removal]
+    D --> E[Skull and Border Artifact Stripping]
+    E --> F[Bounding Box + Center Point Extraction]
+    F --> G[SAM 2 Large - 224M parameters]
+    G --> H[Multi-Mask Candidate Generation]
+    H --> I[Highest IoU Mask Selection]
+    I --> J[Segmentation Overlay + Region Report]
+
+    subgraph "Automatic Prompt Engine"
+        B
+        C
+        D
+        E
+        F
+    end
+
+    subgraph "SAM 2 Inference"
+        G
+        H
+        I
+    end
 ```
-MRI Input
-   |
-CLAHE Contrast Enhancement
-   |
-Top Intensity Percentile Thresholding
-   |
-Morphological Noise Removal
-   |
-Skull and Border Artifact Stripping
-   |
-Bounding Box + Center Point Extraction
-   |
-SAM 2 Large (224M parameters)
-   |
-Multi-Mask Candidate Generation
-   |
-Highest IoU Mask Selection
-   |
-Segmentation Overlay + Region Report
-```
+
+The prompt engine (left of the pipeline) is the only custom component — it exists purely to replace the manual click a standard SAM 2 workflow would require. Everything downstream of the bounding box and point extraction step is stock SAM 2 Large, unmodified and unfine-tuned.
 
 ## Model
 
