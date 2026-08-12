@@ -1,0 +1,869 @@
+"""
+Brain Tumor Segmentation using SAM 2
+=====================================
+pip install git+https://github.com/facebookresearch/sam2.git transformers gradio torch torchvision pillow numpy opencv-python matplotlib
+
+Run: python brain_tumor_sam2.py
+"""
+
+import gradio as gr
+import torch
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from PIL import Image
+from transformers import Sam2Processor, Sam2Model
+import warnings
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────
+#  MODEL LOADING
+# ─────────────────────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[INFO] Using device: {DEVICE}")
+
+print("[INFO] Loading SAM 2 Large...")
+processor = Sam2Processor.from_pretrained("facebook/sam2-hiera-large")
+model     = Sam2Model.from_pretrained("facebook/sam2-hiera-large").to(DEVICE)
+model.eval()
+print("[INFO] Model ready.")
+
+
+# ─────────────────────────────────────────────
+#  AUTO PROMPT GENERATION
+#  Finds the brightest anomalous region in the
+#  MRI scan (tumors appear hyper-intense on T1/T2)
+# ─────────────────────────────────────────────
+def generate_auto_prompts(image_np: np.ndarray):
+    """
+    Automatically detect suspicious bright regions in an MRI and
+    return bounding boxes and center point prompts for SAM 2.
+    Works on grayscale or RGB MRI images.
+    """
+    # Convert to grayscale
+    if image_np.ndim == 3:
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image_np.copy()
+
+    # Enhance contrast
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Threshold top 10% intensity pixels (tumor regions are hyper-intense)
+    threshold = np.percentile(enhanced, 90)
+    binary = (enhanced > threshold).astype(np.uint8) * 255
+
+    # Morphological cleaning
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    # Remove skull/border artifacts (ignore 10% border)
+    h, w = binary.shape
+    margin_h, margin_w = int(h * 0.10), int(w * 0.10)
+    mask_border = np.zeros_like(binary)
+    mask_border[margin_h:h-margin_h, margin_w:w-margin_w] = 1
+    binary = binary * mask_border
+
+    # Find contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        # Fallback: center of image
+        cx, cy = w // 2, h // 2
+        box_size = min(w, h) // 3
+        return (
+            [[[cx, cy]]],
+            [[[1]]],
+            [[cx - box_size, cy - box_size, cx + box_size, cy + box_size]]
+        )
+
+    # Sort by area, take top 2 largest
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
+
+    points, labels, boxes = [], [], []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 100:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        # Center point of bounding box
+        cx, cy = x + bw // 2, y + bh // 2
+        # Slight padding on bounding box
+        pad = 10
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(w, x + bw + pad), min(h, y + bh + pad)
+        points.append([[cx, cy]])
+        labels.append([1])
+        boxes.append([x1, y1, x2, y2])
+
+    if not points:
+        cx, cy = w // 2, h // 2
+        box_size = min(w, h) // 3
+        return (
+            [[[cx, cy]]],
+            [[[1]]],
+            [[cx - box_size, cy - box_size, cx + box_size, cy + box_size]]
+        )
+
+    return [points], [labels], boxes
+
+
+# ─────────────────────────────────────────────
+#  SEGMENTATION ENGINE
+# ─────────────────────────────────────────────
+def run_segmentation(image_pil: Image.Image):
+    image_np = np.array(image_pil.convert("RGB"))
+    h, w = image_np.shape[:2]
+
+    # Generate automatic prompts
+    input_points, input_labels, boxes = generate_auto_prompts(image_np)
+
+    # Prepare inputs for SAM 2
+    inputs = processor(
+        images=image_pil.convert("RGB"),
+        input_points=input_points,
+        input_labels=input_labels,
+        return_tensors="pt"
+    ).to(DEVICE)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # Post-process masks
+    masks = processor.post_process_masks(
+        outputs.pred_masks.cpu(),
+        inputs["original_sizes"]
+    )[0]  # shape: (num_objects, num_masks, H, W)
+
+    # Pick highest IoU mask per object
+    iou_scores = outputs.iou_scores.cpu()  # (1, num_objects, num_masks)
+    best_masks = []
+    for obj_idx in range(masks.shape[0]):
+        best_idx = torch.argmax(iou_scores[0, obj_idx]).item()
+        best_masks.append(masks[obj_idx, best_idx].numpy())
+
+    return best_masks, boxes, image_np
+
+
+# ─────────────────────────────────────────────
+#  VISUALIZATION
+# ─────────────────────────────────────────────
+COLORS = [
+    (255, 80,  80),   # red-ish
+    (80,  200, 255),  # cyan-ish
+    (80,  255, 150),  # green-ish
+    (255, 180, 50),   # amber
+]
+
+def overlay_masks(image_np, masks, boxes, alpha=0.45):
+    overlay = image_np.copy().astype(np.float32)
+    result  = image_np.copy().astype(np.float32)
+
+    for i, mask in enumerate(masks):
+        color = np.array(COLORS[i % len(COLORS)], dtype=np.float32)
+        mask_bool = mask.astype(bool)
+        overlay[mask_bool] = color
+
+    blended = cv2.addWeighted(result, 1 - alpha, overlay, alpha, 0)
+
+    # Draw bounding boxes
+    for i, box in enumerate(boxes):
+        color_bgr = tuple(int(c) for c in reversed(COLORS[i % len(COLORS)]))
+        x1, y1, x2, y2 = [int(v) for v in box]
+        cv2.rectangle(blended, (x1, y1), (x2, y2), color_bgr, 2)
+        label = f"Region {i+1}"
+        cv2.putText(blended, label, (x1, max(0, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2)
+
+    # Mask contours for crisp edges
+    for i, mask in enumerate(masks):
+        color_bgr = tuple(int(c) for c in reversed(COLORS[i % len(COLORS)]))
+        mask_u8 = (mask * 255).astype(np.uint8)
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(blended, contours, -1, color_bgr, 2)
+
+    return blended.astype(np.uint8)
+
+
+def compute_stats(masks, image_np):
+    h, w = image_np.shape[:2]
+    total_pixels = h * w
+    stats = []
+    for i, mask in enumerate(masks):
+        area_px = int(mask.sum())
+        area_pct = round(area_px / total_pixels * 100, 2)
+        stats.append(f"**Region {i+1}:** {area_px:,} px  ({area_pct}% of image)")
+    return stats
+
+
+# ─────────────────────────────────────────────
+#  MAIN INFERENCE FUNCTION
+# ─────────────────────────────────────────────
+def segment_brain_tumor(image):
+    if image is None:
+        return None, "⚠️ Please upload an MRI scan."
+
+    try:
+        image_pil = Image.fromarray(image) if isinstance(image, np.ndarray) else image
+        masks, boxes, image_np = run_segmentation(image_pil)
+
+        if not masks:
+            return image, "✅ No significant anomalous regions detected."
+
+        result_np = overlay_masks(image_np, masks, boxes)
+        stats = compute_stats(masks, image_np)
+
+        # Build report
+        n = len(masks)
+        report_lines = [
+            f"### 🧠 Segmentation Complete",
+            f"**Detected Regions:** {n}",
+            "",
+            "**Region Analysis:**",
+        ] + stats + [
+            "",
+            "---",
+            "**⚕️ Clinical Note:** This output is AI-generated for research/educational purposes only. "
+            "All findings must be reviewed by a qualified radiologist before any clinical decision.",
+        ]
+        report = "\n".join(report_lines)
+
+        return result_np, report
+
+    except Exception as e:
+        return image, f"❌ Error during segmentation: {str(e)}"
+
+
+# ─────────────────────────────────────────────
+#  GRADIO UI  — Dark Clinical Dashboard
+# ─────────────────────────────────────────────
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap');
+
+:root {
+    --white:       #ffffff;
+    --off-white:   #f7f8fa;
+    --surface:     #f0f2f5;
+    --border:      #dde1e8;
+    --border-dark: #c4cad4;
+    --ink:         #0a0d12;
+    --ink-2:       #2e3440;
+    --ink-3:       #5a6478;
+    --ink-4:       #8c95a6;
+    --blue:        #1a56db;
+    --blue-light:  #e8effe;
+    --blue-mid:    #3b82f6;
+    --red:         #c0392b;
+    --red-light:   #fdf2f2;
+    --green:       #15803d;
+    --green-light: #f0fdf4;
+    --font-serif:  'Instrument Serif', Georgia, serif;
+    --font-sans:   'IBM Plex Sans', system-ui, sans-serif;
+    --font-mono:   'IBM Plex Mono', monospace;
+    --radius:      10px;
+    --shadow-sm:   0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-md:   0 4px 16px rgba(0,0,0,0.08), 0 2px 6px rgba(0,0,0,0.04);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body, .gradio-container {
+    background: var(--off-white) !important;
+    font-family: var(--font-sans) !important;
+    color: var(--ink) !important;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ── TOPBAR ── */
+.topbar {
+    background: var(--white);
+    border-bottom: 1px solid var(--border);
+    padding: 0 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+.topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+.logo-icon {
+    width: 36px; height: 36px;
+    background: var(--ink);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+    flex-shrink: 0;
+}
+.topbar-brand {
+    font-family: var(--font-sans) !important;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--ink) !important;
+    letter-spacing: -0.01em;
+}
+.topbar-brand span {
+    color: var(--blue) !important;
+}
+.topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 100px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    font-family: var(--font-mono) !important;
+}
+.badge-blue  { background: var(--blue-light); color: var(--blue); }
+.badge-green { background: var(--green-light); color: var(--green); }
+.badge-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: blink 2.5s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+/* ── HERO ── */
+.hero {
+    padding: 48px 40px 36px;
+    background: var(--white);
+    border-bottom: 1px solid var(--border);
+}
+.hero-eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono) !important;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--blue);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+}
+.hero-eyebrow-line {
+    width: 28px; height: 1.5px;
+    background: var(--blue);
+}
+.hero-title {
+    font-family: var(--font-serif) !important;
+    font-size: 2.8rem !important;
+    font-weight: 400 !important;
+    color: var(--ink) !important;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin-bottom: 14px;
+}
+.hero-title em {
+    font-style: italic;
+    color: var(--blue);
+}
+.hero-desc {
+    font-size: 1rem;
+    color: var(--ink-3);
+    max-width: 600px;
+    line-height: 1.65;
+}
+.hero-meta {
+    display: flex;
+    gap: 24px;
+    margin-top: 24px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+}
+.hero-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.hero-stat-value {
+    font-family: var(--font-mono) !important;
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--ink);
+}
+.hero-stat-label {
+    font-size: 0.75rem;
+    color: var(--ink-4);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+/* ── MAIN LAYOUT ── */
+.main-grid {
+    padding: 32px 40px;
+    max-width: 1400px;
+    margin: 0 auto;
+}
+
+/* ── SECTION HEADERS ── */
+.section-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+.section-icon {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px;
+    flex-shrink: 0;
+}
+.section-title {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--ink);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+/* ── CARDS ── */
+.card {
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+}
+.card-header {
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.card-title {
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: var(--ink-2);
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+}
+.card-body { padding: 22px; }
+
+/* ── STEPS ── */
+.steps {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 22px;
+}
+.step {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    background: var(--off-white);
+    border: 1px solid var(--border);
+}
+.step-num {
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: var(--ink);
+    color: var(--white);
+    font-size: 0.7rem;
+    font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+.step-text {
+    font-size: 0.88rem;
+    color: var(--ink-2);
+    line-height: 1.5;
+}
+.step-text strong { color: var(--ink); font-weight: 600; }
+
+/* ── BUTTONS ── */
+button.primary, .gr-button-primary {
+    background: var(--ink) !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-family: var(--font-sans) !important;
+    font-size: 0.92rem !important;
+    font-weight: 600 !important;
+    color: var(--white) !important;
+    padding: 13px 28px !important;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s, box-shadow 0.15s;
+    box-shadow: var(--shadow-sm);
+    width: 100%;
+}
+button.primary:hover {
+    background: #1a2030 !important;
+    box-shadow: var(--shadow-md);
+    transform: translateY(-1px);
+}
+button.secondary, .gr-button-secondary {
+    background: var(--white) !important;
+    border: 1px solid var(--border-dark) !important;
+    border-radius: 8px !important;
+    font-family: var(--font-sans) !important;
+    font-size: 0.88rem !important;
+    font-weight: 500 !important;
+    color: var(--ink-3) !important;
+    transition: background 0.15s;
+}
+button.secondary:hover {
+    background: var(--surface) !important;
+    color: var(--ink) !important;
+}
+
+/* ── IMAGE AREAS ── */
+.gr-image, .image-frame {
+    border-radius: 8px !important;
+    border: 1px solid var(--border) !important;
+    background: var(--surface) !important;
+}
+
+/* ── TABS ── */
+.tab-nav {
+    border-bottom: 1px solid var(--border) !important;
+    background: transparent !important;
+}
+.tab-nav button {
+    font-family: var(--font-sans) !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    color: var(--ink-4) !important;
+    border: none !important;
+    border-bottom: 2px solid transparent !important;
+    background: transparent !important;
+    padding: 12px 18px !important;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    transition: color 0.15s, border-color 0.15s;
+}
+.tab-nav button.selected {
+    color: var(--ink) !important;
+    border-bottom-color: var(--ink) !important;
+}
+.tab-nav button:hover:not(.selected) {
+    color: var(--ink-2) !important;
+}
+
+/* ── LABELS ── */
+label span, .gr-form label span {
+    font-family: var(--font-sans) !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    color: var(--ink-3) !important;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+/* ── MARKDOWN OUTPUT ── */
+.gr-markdown {
+    font-family: var(--font-sans) !important;
+    font-size: 0.92rem !important;
+    line-height: 1.75 !important;
+    color: var(--ink-2) !important;
+}
+.gr-markdown h3 {
+    font-family: var(--font-sans) !important;
+    font-size: 0.82rem !important;
+    font-weight: 700 !important;
+    color: var(--ink) !important;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin: 18px 0 10px !important;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+.gr-markdown strong { color: var(--ink); font-weight: 600; }
+.gr-markdown hr { border-color: var(--border) !important; margin: 16px 0; }
+.gr-markdown blockquote {
+    border-left: 3px solid var(--blue);
+    padding-left: 12px;
+    color: var(--ink-3);
+    font-style: italic;
+}
+.gr-markdown ul li::marker { color: var(--blue); }
+
+/* ── WARNING ── */
+.warning-card {
+    background: var(--red-light);
+    border: 1px solid #f5c0bc;
+    border-radius: 8px;
+    padding: 13px 16px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    margin-top: 16px;
+}
+.warning-icon { font-size: 15px; flex-shrink: 0; margin-top: 1px; }
+.warning-text {
+    font-size: 0.8rem;
+    color: var(--red);
+    line-height: 1.55;
+    font-weight: 500;
+}
+
+/* ── PIPELINE PILLS ── */
+.pipeline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+.pill {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--ink-2);
+    font-family: var(--font-mono) !important;
+}
+.pill-arrow {
+    color: var(--ink-4);
+    font-size: 0.7rem;
+    margin: 0 -2px;
+}
+
+/* ── FOOTER ── */
+.footer {
+    border-top: 1px solid var(--border);
+    padding: 18px 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--white);
+    margin-top: 24px;
+}
+.footer-left {
+    font-size: 0.78rem;
+    color: var(--ink-4);
+    font-family: var(--font-mono) !important;
+}
+.footer-right {
+    font-size: 0.78rem;
+    color: var(--ink-4);
+}
+"""
+
+TOPBAR_HTML = """
+<div class="topbar">
+  <div class="topbar-left">
+    <div class="logo-icon">🧠</div>
+    <span class="topbar-brand">Brain<span>Scan</span> AI</span>
+  </div>
+  <div class="topbar-right">
+    <span class="badge badge-green"><span class="badge-dot"></span>Model Ready</span>
+    <span class="badge badge-blue">SAM 2 Large · 224M</span>
+  </div>
+</div>
+"""
+
+HERO_HTML = """
+<div class="hero">
+  <div class="hero-eyebrow">
+    <div class="hero-eyebrow-line"></div>
+    Zero-Shot Radiology AI · Research Platform
+  </div>
+  <h1 class="hero-title">Brain Tumor<br><em>Segmentation</em></h1>
+  <p class="hero-desc">
+    Automatically detect and segment anomalous regions in brain MRI scans using
+    Meta's Segment Anything Model 2 — no manual annotation required.
+  </p>
+  <div class="hero-meta">
+    <div class="hero-stat">
+      <span class="hero-stat-value">SAM 2</span>
+      <span class="hero-stat-label">Foundation Model</span>
+    </div>
+    <div class="hero-stat">
+      <span class="hero-stat-value">224M</span>
+      <span class="hero-stat-label">Parameters</span>
+    </div>
+    <div class="hero-stat">
+      <span class="hero-stat-value">Zero-Shot</span>
+      <span class="hero-stat-label">No Fine-Tuning</span>
+    </div>
+    <div class="hero-stat">
+      <span class="hero-stat-value">Auto-Prompt</span>
+      <span class="hero-stat-label">Engine</span>
+    </div>
+  </div>
+</div>
+"""
+
+STEPS_HTML = """
+<div class="steps">
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-text"><strong>Upload</strong> a brain MRI scan — T1, T2, or FLAIR axial slice. JPG, PNG, or TIFF supported.</div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-text"><strong>Run Segmentation</strong> — the auto-prompt engine detects hyper-intense regions and feeds them to SAM 2.</div>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-text"><strong>Review</strong> the segmentation overlay and region report on the right panel.</div>
+  </div>
+</div>
+"""
+
+WARNING_HTML = """
+<div class="warning-card">
+  <span class="warning-icon">⚠️</span>
+  <span class="warning-text">
+    <strong>Research & Educational Use Only.</strong> This tool is not a certified medical device.
+    All outputs must be reviewed by a qualified radiologist before any clinical decision is made.
+  </span>
+</div>
+"""
+
+PIPELINE_HTML = """
+<div class="pipeline">
+  <span class="pill">📥 MRI Input</span>
+  <span class="pill-arrow">→</span>
+  <span class="pill">🔬 CLAHE Enhancement</span>
+  <span class="pill-arrow">→</span>
+  <span class="pill">📍 Auto Prompt Gen</span>
+  <span class="pill-arrow">→</span>
+  <span class="pill">🧠 SAM 2 Large</span>
+  <span class="pill-arrow">→</span>
+  <span class="pill">🎯 Mask Selection</span>
+  <span class="pill-arrow">→</span>
+  <span class="pill">📊 Report</span>
+</div>
+"""
+
+FOOTER_HTML = """
+<div class="footer">
+  <span class="footer-left">BrainScan AI · Powered by facebook/sam2-hiera-large · Apache 2.0</span>
+  <span class="footer-right">Ravi et al., SAM 2: Segment Anything in Images and Videos · arXiv:2408.00714</span>
+</div>
+"""
+
+with gr.Blocks(css=CSS, title="BrainScan AI — Brain Tumor Segmentation") as demo:
+
+    gr.HTML(TOPBAR_HTML)
+    gr.HTML(HERO_HTML)
+
+    with gr.Row(equal_height=False, elem_classes=["main-grid"]):
+
+        # ── LEFT PANEL ──────────────────────────────
+        with gr.Column(scale=1, min_width=400):
+
+            gr.HTML("""<div class="section-header">
+              <div class="section-icon">📤</div>
+              <span class="section-title">Input</span>
+            </div>""")
+
+            gr.HTML(STEPS_HTML)
+
+            image_input = gr.Image(
+                label="MRI Scan",
+                type="numpy",
+                height=340,
+            )
+
+            with gr.Row():
+                run_btn   = gr.Button("▶  Run Segmentation", variant="primary", scale=3)
+                clear_btn = gr.Button("Clear", variant="secondary", scale=1)
+
+            gr.HTML(WARNING_HTML)
+
+            # Example images
+            gr.Examples(
+                examples=[],
+                inputs=image_input,
+                label="Example MRI Scans",
+            )
+
+        # ── RIGHT PANEL ─────────────────────────────
+        with gr.Column(scale=1, min_width=400):
+
+            gr.HTML("""<div class="section-header">
+              <div class="section-icon">📊</div>
+              <span class="section-title">Output</span>
+            </div>""")
+
+            with gr.Tab("Segmentation Result"):
+                image_output = gr.Image(
+                    label="Segmentation Overlay",
+                    type="numpy",
+                    interactive=False,
+                    height=340,
+                )
+                report_output = gr.Markdown(
+                    value="*Upload an MRI scan and click Run Segmentation to see results here.*"
+                )
+
+            with gr.Tab("Pipeline & Model"):
+                gr.HTML(PIPELINE_HTML)
+                gr.Markdown("""
+### SAM 2 Architecture
+**Model:** facebook/sam2-hiera-large  
+**Encoder:** Hiera — Hierarchical Vision Transformer  
+**Decoder:** Streaming Memory Attention + Mask Decoder  
+**Parameters:** ~224M · Released by Meta AI FAIR, August 2024
+
+---
+### Auto-Prompt Engine
+Rather than requiring manual clicks, the system:
+- Applies **CLAHE** contrast enhancement to boost tumor signal
+- Thresholds the **top 10% intensity pixels** (tumors are hyper-intense on T1/FLAIR)
+- Cleans artifacts with **morphological open/close** operations
+- Strips **skull and image-border noise** (10% margin mask)
+- Extracts **bounding boxes + center points** as SAM 2 prompts automatically
+- Picks the **highest IoU mask** per detected region from SAM 2's outputs
+
+---
+### Dataset Compatibility
+Works best with: T1-contrast, T2, FLAIR axial MRI slices  
+Compatible formats: JPG · PNG · TIFF · DICOM screenshots
+                """)
+
+    gr.HTML(FOOTER_HTML)
+
+    # ── EVENT HANDLERS ───────────────────────────
+    run_btn.click(
+        fn=segment_brain_tumor,
+        inputs=[image_input],
+        outputs=[image_output, report_output],
+        api_name="segment",
+    )
+
+    clear_btn.click(
+        fn=lambda: (None, None, "*Upload an MRI scan and click Run Segmentation to see results here.*"),
+        inputs=[],
+        outputs=[image_input, image_output, report_output],
+    )
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7861,
+        share=True,           # Creates public Gradio link — useful in Kaggle
+        show_error=True,
+    )
